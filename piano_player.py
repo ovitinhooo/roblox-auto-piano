@@ -19,6 +19,8 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.parse
+import webbrowser
 from ctypes import wintypes
 from tkinter import filedialog, messagebox, ttk
 
@@ -32,6 +34,14 @@ HIGH_NOTE = LOW_NOTE + len(KEYS) - 1  # 96
 NOTE_TO_KEY = {LOW_NOTE + i: k for i, k in enumerate(KEYS)}
 KEY_TO_NOTE = {k: n for n, k in NOTE_TO_KEY.items()}
 
+# Modo 88 teclas (A0 .. C8): notas extras com Ctrl + tecla
+CTRL_PREFIX = "c:"
+LOW_88 = "1234567890qwert"   # A0 .. B1  (MIDI 21 .. 35)
+HIGH_88 = "yuiopasdfghj"     # C#7 .. C8 (MIDI 97 .. 108)
+NOTE_TO_KEY_88 = dict(NOTE_TO_KEY)
+NOTE_TO_KEY_88.update({21 + i: CTRL_PREFIX + k for i, k in enumerate(LOW_88)})
+NOTE_TO_KEY_88.update({97 + i: CTRL_PREFIX + k for i, k in enumerate(HIGH_88)})
+
 SHIFT_SYMBOLS = {"!": "1", "@": "2", "$": "4", "%": "5", "^": "6", "*": "8", "(": "9"}
 
 SCANCODES = {
@@ -44,15 +54,19 @@ SCANCODES = {
     "z": 0x2C, "x": 0x2D, "c": 0x2E, "v": 0x2F, "b": 0x30, "n": 0x31, "m": 0x32,
 }
 SC_LSHIFT = 0x2A
+SC_LCTRL = 0x1D
+SC_SPACE = 0x39
 
 
 def split_key(ch):
-    """Retorna (tecla_base, precisa_shift)."""
+    """Retorna (tecla_base, precisa_shift, precisa_ctrl)."""
+    if ch.startswith(CTRL_PREFIX):
+        return ch[len(CTRL_PREFIX):], False, True
     if ch in SHIFT_SYMBOLS:
-        return SHIFT_SYMBOLS[ch], True
+        return SHIFT_SYMBOLS[ch], True, False
     if ch.isalpha() and ch.isupper():
-        return ch.lower(), True
-    return ch, False
+        return ch.lower(), True, False
+    return ch, False, False
 
 
 # ---------------------------------------------------------------------------
@@ -104,27 +118,56 @@ def _send_scancodes(codes, up):
     user32.SendInput(len(codes), arr, ctypes.sizeof(INPUT))
 
 
-def press_keys(chars, hold=0.012):
-    """Pressiona um conjunto de teclas ao mesmo tempo (acorde)."""
-    normal, shifted = [], []
-    for ch in chars:
-        base, needs_shift = split_key(ch)
-        sc = SCANCODES.get(base)
-        if sc is None:
-            continue
-        (shifted if needs_shift else normal).append(sc)
+class Keyboard:
+    """Controla as teclas seguradas. Cada nota tem um id para que o "soltar"
+    de uma nota antiga não solte a mesma tecla tocada de novo depois."""
 
-    if normal:
-        _send_scancodes(normal, up=False)
-        time.sleep(hold)
-        _send_scancodes(normal, up=True)
-    if shifted:
-        _send_scancodes([SC_LSHIFT], up=False)
-        time.sleep(0.004)
-        _send_scancodes(shifted, up=False)
-        time.sleep(hold)
-        _send_scancodes(shifted, up=True)
-        _send_scancodes([SC_LSHIFT], up=True)
+    def __init__(self):
+        self.owner = {}  # scancode -> (tecla, id)
+
+    def down(self, chars, ident):
+        groups = {(False, False): [], (True, False): [], (False, True): []}
+        used = set()
+        for ch in chars:
+            base, shift, ctrl = split_key(ch)
+            sc = SCANCODES.get(base)
+            if sc is None or sc in used:
+                continue
+            used.add(sc)
+            if sc in self.owner:  # mesma tecla ainda segurada: solta e toca de novo
+                _send_scancodes([sc], up=True)
+            self.owner[sc] = (ch, ident)
+            groups[(shift, ctrl)].append(sc)
+
+        if groups[(False, False)]:
+            _send_scancodes(groups[(False, False)], up=False)
+        for (shift, ctrl), codes in groups.items():
+            if not codes or (shift, ctrl) == (False, False):
+                continue
+            mod = SC_LSHIFT if shift else SC_LCTRL
+            _send_scancodes([mod], up=False)
+            time.sleep(0.004)
+            _send_scancodes(codes, up=False)
+            time.sleep(0.004)
+            _send_scancodes([mod], up=True)
+
+    def up(self, ch, ident):
+        base, _, _ = split_key(ch)
+        sc = SCANCODES.get(base)
+        if sc is not None and self.owner.get(sc) == (ch, ident):
+            _send_scancodes([sc], up=True)
+            del self.owner[sc]
+
+    def release_all(self):
+        if self.owner:
+            _send_scancodes(list(self.owner), up=True)
+            self.owner.clear()
+
+
+def tap(sc):
+    _send_scancodes([sc], up=False)
+    time.sleep(0.02)
+    _send_scancodes([sc], up=True)
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +179,12 @@ def press_keys(chars, hold=0.012):
 #   |              = pausa de 2 passos
 #   -              = pausa de 1 passo
 #   linhas iniciadas com # são comentários;  "# bpm: 240" define o tempo
+#
+# Eventos: (tempo_segundos, [teclas], [durações_segundos])
 # ---------------------------------------------------------------------------
+
+MAX_HOLD = 4.0
+
 
 def read_sheet_bpm(text, default=200):
     for line in text.splitlines():
@@ -149,11 +197,12 @@ def read_sheet_bpm(text, default=200):
 
 
 def parse_sheet(text, bpm):
-    """Converte o texto em lista de eventos (tempo_segundos, [teclas])."""
+    """Converte o texto em eventos. Cada nota fica segurada até a próxima começar."""
     step = 60.0 / bpm
     lines = [l for l in text.splitlines() if not l.strip().startswith("#")]
     body = "\n".join(lines)
-    events, t, i = [], 0.0, 0
+    raw, group_start = [], []  # raw: (t, teclas, grupo)
+    t, i = 0.0, 0
     while i < len(body):
         ch = body[i]
         if ch == "[":
@@ -163,23 +212,32 @@ def parse_sheet(text, bpm):
             inner = body[i + 1:j]
             notes = [c for c in inner if c in KEY_TO_NOTE]
             if notes:
+                g = len(group_start)
+                group_start.append(t)
                 if " " in inner.strip():  # arpejo
                     sub = min(step / max(len(notes), 1), 0.06)
                     for k, n in enumerate(notes):
-                        events.append((t + k * sub, [n]))
+                        raw.append((t + k * sub, [n], g))
                 else:
-                    events.append((t, notes))
+                    raw.append((t, notes, g))
                 t += step
             i = j + 1
             continue
         if ch in KEY_TO_NOTE:
-            events.append((t, [ch]))
+            raw.append((t, [ch], len(group_start)))
+            group_start.append(t)
             t += step
         elif ch in " \n\t-":
             t += step
         elif ch == "|":
             t += 2 * step
         i += 1
+
+    events = []
+    for et, keys, g in raw:
+        nxt = group_start[g + 1] if g + 1 < len(group_start) else et + 2 * step
+        dur = max(0.03, min((nxt - et) * 0.95, MAX_HOLD))
+        events.append((et, keys, [dur] * len(keys)))
     return events
 
 
@@ -198,7 +256,7 @@ def _read_varlen(data, pos):
 
 
 def parse_midi(path):
-    """Retorna (lista de (tempo_seg, nota, canal), duração_total)."""
+    """Retorna lista de (início_seg, nota, canal, duração_seg)."""
     with open(path, "rb") as f:
         data = f.read()
     if data[:4] != b"MThd":
@@ -210,7 +268,7 @@ def parse_midi(path):
     tpq = division
     pos = 8 + hlen
 
-    raw_notes = []   # (tick, nota, canal)
+    raw_notes = []   # (tick_inicio, tick_fim, nota, canal)
     tempos = []      # (tick, microssegundos por semínima)
     for _ in range(ntracks):
         while pos + 8 <= len(data) and data[pos:pos + 4] != b"MTrk":
@@ -223,6 +281,7 @@ def parse_midi(path):
         p, end = pos + 8, min(pos + 8 + tlen, len(data))
         pos = end
         tick, status = 0, 0
+        active = {}  # (canal, nota) -> [ticks de início]
         while p < end:
             delta, p = _read_varlen(data, p)
             tick += delta
@@ -251,7 +310,14 @@ def parse_midi(path):
                     d1, d2 = data[p], data[p + 1]
                     p += 2
                     if kind == 0x90 and d2 > 0:
-                        raw_notes.append((tick, d1, ch))
+                        active.setdefault((ch, d1), []).append(tick)
+                    elif kind == 0x80 or (kind == 0x90 and d2 == 0):
+                        starts = active.get((ch, d1))
+                        if starts:
+                            raw_notes.append((starts.pop(0), tick, d1, ch))
+        for (ch, n), starts in active.items():  # notas sem "note off"
+            for s in starts:
+                raw_notes.append((s, s + tpq, n, ch))
 
     # converte ticks para segundos usando o mapa de tempo
     tempos.sort()
@@ -276,44 +342,58 @@ def parse_midi(path):
         stk, ssec, sus = seg_start[lo]
         return ssec + (t - stk) * sus / 1e6 / tpq
 
-    notes = sorted((tick_to_sec(t), n, c) for t, n, c in raw_notes)
+    notes = []
+    for s, e, n, c in raw_notes:
+        ts = tick_to_sec(s)
+        notes.append((ts, n, c, max(0.0, tick_to_sec(e) - ts)))
+    notes.sort()
     return notes
 
 
-def midi_to_events(notes, transpose=0, skip_drums=True, chord_window=0.025):
+def midi_to_events(notes, transpose=0, skip_drums=True, keys88=False, chord_window=0.025):
     """Agrupa notas próximas em acordes e converte para teclas."""
+    note_to_key = NOTE_TO_KEY_88 if keys88 else NOTE_TO_KEY
+    low, high = min(note_to_key), max(note_to_key)
     events = []
     out_of_range = 0
-    for t, n, ch in notes:
+    for t, n, ch, dur in notes:
         if skip_drums and ch == 9:
             continue
         n += transpose
-        if n < LOW_NOTE or n > HIGH_NOTE:
+        if n < low or n > high:
             out_of_range += 1
-            while n < LOW_NOTE:
+            while n < low:
                 n += 12
-            while n > HIGH_NOTE:
+            while n > high:
                 n -= 12
-        key = NOTE_TO_KEY[n]
+        key = note_to_key[n]
+        dur = max(0.03, min(dur, MAX_HOLD))
         if events and t - events[-1][0] <= chord_window:
-            if key not in events[-1][1]:
-                events[-1][1].append(key)
+            keys, durs = events[-1][1], events[-1][2]
+            if key in keys:
+                k = keys.index(key)
+                durs[k] = max(durs[k], dur)
+            else:
+                keys.append(key)
+                durs.append(dur)
         else:
-            events.append((t, [key]))
+            events.append((t, [key], [dur]))
     if events:
         t0 = events[0][0]
-        events = [(t - t0, k) for t, k in events]
+        events = [(t - t0, k, d) for t, k, d in events]
     return events, out_of_range
 
 
-def best_transpose(notes, skip_drums=True):
+def best_transpose(notes, skip_drums=True, keys88=False):
     """Escolhe a oitava (-24..24) que deixa mais notas dentro do teclado, sem mudar o tom."""
-    pitches = [n for _, n, ch in notes if not (skip_drums and ch == 9)]
+    note_to_key = NOTE_TO_KEY_88 if keys88 else NOTE_TO_KEY
+    low, high = min(note_to_key), max(note_to_key)
+    pitches = [n for _, n, ch, _ in notes if not (skip_drums and ch == 9)]
     if not pitches:
         return 0
     best, best_score = 0, None
     for tr in (-24, -12, 0, 12, 24):
-        inside = sum(LOW_NOTE <= p + tr <= HIGH_NOTE for p in pitches)
+        inside = sum(low <= p + tr <= high for p in pitches)
         score = (inside, -abs(tr))
         if best_score is None or score > best_score:
             best, best_score = tr, score
@@ -321,14 +401,18 @@ def best_transpose(notes, skip_drums=True):
 
 
 def events_to_sheet(events, step):
-    """Converte eventos em texto Virtual Piano (aproximado), para edição."""
+    """Converte eventos em texto Virtual Piano (aproximado), para visualização.
+    Notas extras do modo 88 teclas aparecem como {tecla} (= Ctrl + tecla)."""
+    def show(k):
+        return "{" + k[2:] + "}" if k.startswith(CTRL_PREFIX) else k
+
     out, last_t = [], 0.0
-    for idx, (t, keys) in enumerate(events):
+    for idx, (t, keys, _) in enumerate(events):
         if idx > 0:
             gap = round((t - last_t) / step) - 1
             if gap > 0:
                 out.append(" " * min(gap, 8))
-        out.append(keys[0] if len(keys) == 1 else "[" + "".join(keys) + "]")
+        out.append(show(keys[0]) if len(keys) == 1 else "[" + "".join(map(show, keys)) + "]")
         last_t = t
     return "".join(out)
 
@@ -336,6 +420,9 @@ def events_to_sheet(events, step):
 # ---------------------------------------------------------------------------
 # Motor de reprodução
 # ---------------------------------------------------------------------------
+
+SUSTAIN_OFF, SUSTAIN_TOGGLE, SUSTAIN_HOLD = 0, 1, 2
+
 
 class Player:
     def __init__(self, on_progress, on_finish):
@@ -353,11 +440,11 @@ class Player:
     def paused(self):
         return self.pause_flag.is_set()
 
-    def play(self, events, speed=1.0, delay=0.0):
+    def play(self, events, speed=1.0, delay=0.0, sustain=SUSTAIN_OFF):
         self.stop()
         self.stop_flag.clear()
         self.pause_flag.clear()
-        self.thread = threading.Thread(target=self._run, args=(events, speed, delay), daemon=True)
+        self.thread = threading.Thread(target=self._run, args=(events, speed, delay, sustain), daemon=True)
         self.thread.start()
 
     def toggle_pause(self):
@@ -372,7 +459,7 @@ class Player:
         if self.thread and self.thread.is_alive() and threading.current_thread() is not self.thread:
             self.thread.join(timeout=1)
 
-    def _run(self, events, speed, delay):
+    def _run(self, events, speed, delay, sustain):
         total = len(events)
         end_time = events[-1][0] / speed if events else 0
         t_deadline = time.perf_counter() + delay
@@ -383,30 +470,54 @@ class Player:
             self.on_progress(-1, total, t_deadline - time.perf_counter(), end_time)
             time.sleep(0.05)
 
-        start = time.perf_counter()
-        last_report = 0
-        for i, (t, keys) in enumerate(events):
-            target = t / speed
-            while True:
-                if self.stop_flag.is_set():
-                    self.on_finish(False)
-                    return
-                if self.pause_flag.is_set():
-                    paused_at = time.perf_counter()
-                    while self.pause_flag.is_set() and not self.stop_flag.is_set():
-                        time.sleep(0.03)
-                    start += time.perf_counter() - paused_at
-                    continue
-                remaining = target - (time.perf_counter() - start)
-                if remaining <= 0:
-                    break
-                time.sleep(min(remaining, 0.02) if remaining > 0.003 else 0)
-            press_keys(keys)
-            now = time.perf_counter()
-            if now - last_report > 0.1 or i == total - 1:
-                last_report = now
-                self.on_progress(i + 1, total, now - start, end_time)
-        self.on_finish(True)
+        # linha do tempo: apertar (1) e soltar (0); no mesmo instante, solta antes de apertar
+        actions = []
+        for idx, (t, keys, durs) in enumerate(events):
+            actions.append((t / speed, 1, idx, keys))
+            for k, d in zip(keys, durs):
+                actions.append(((t + d) / speed, 0, idx, k))
+        actions.sort(key=lambda a: (a[0], a[1]))
+
+        kb = Keyboard()
+        if sustain == SUSTAIN_TOGGLE:
+            tap(SC_SPACE)
+        elif sustain == SUSTAIN_HOLD:
+            _send_scancodes([SC_SPACE], up=False)
+        completed = False
+        try:
+            start = time.perf_counter()
+            last_report = 0
+            for when, kind, idx, keys in actions:
+                while True:
+                    if self.stop_flag.is_set():
+                        return
+                    if self.pause_flag.is_set():
+                        kb.release_all()
+                        paused_at = time.perf_counter()
+                        while self.pause_flag.is_set() and not self.stop_flag.is_set():
+                            time.sleep(0.03)
+                        start += time.perf_counter() - paused_at
+                        continue
+                    remaining = when - (time.perf_counter() - start)
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(remaining, 0.02) if remaining > 0.003 else 0)
+                if kind == 1:
+                    kb.down(keys, idx)
+                    now = time.perf_counter()
+                    if now - last_report > 0.1 or idx == total - 1:
+                        last_report = now
+                        self.on_progress(idx + 1, total, now - start, end_time)
+                else:
+                    kb.up(keys, idx)
+            completed = True
+        finally:
+            kb.release_all()
+            if sustain == SUSTAIN_TOGGLE:
+                tap(SC_SPACE)
+            elif sustain == SUSTAIN_HOLD:
+                _send_scancodes([SC_SPACE], up=True)
+            self.on_finish(completed)
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +572,8 @@ def fmt_time(s):
 
 class App:
     VK_F5, VK_F6 = 0x74, 0x75
+    HOLD_OPTIONS = ["Segurar (duração real)", "Curtas (só tocar)"]
+    SUSTAIN_OPTIONS = ["Desligado", "Alternar com Espaço", "Segurar Espaço"]
 
     def __init__(self, root):
         self.root = root
@@ -494,6 +607,22 @@ class App:
         # Biblioteca
         left = ttk.LabelFrame(main, text="Músicas", padding=6)
         left.pack(side="left", fill="y")
+
+        search = ttk.Frame(left)
+        search.pack(fill="x", pady=(0, 6))
+        ttk.Label(search, text="Buscar música na internet:").pack(anchor="w")
+        self.search_var = tk.StringVar()
+        entry = ttk.Entry(search, textvariable=self.search_var)
+        entry.pack(fill="x", pady=2)
+        entry.bind("<Return>", lambda e: self.web_search("virtual piano sheet"))
+        sbtns = ttk.Frame(search)
+        sbtns.pack(fill="x")
+        ttk.Button(sbtns, text="🔎 Partitura", command=lambda: self.web_search("virtual piano sheet")
+                   ).pack(side="left", expand=True, fill="x")
+        ttk.Button(sbtns, text="🔎 MIDI", command=lambda: self.web_search("midi piano")
+                   ).pack(side="left", expand=True, fill="x")
+        ttk.Button(search, text="📋 Colar partitura copiada", command=self.paste_sheet).pack(fill="x", pady=(2, 0))
+
         self.listbox = tk.Listbox(left, width=32, activestyle="none", exportselection=False)
         self.listbox.pack(fill="both", expand=True)
         self.listbox.bind("<<ListboxSelect>>", lambda e: self.load_selected())
@@ -556,6 +685,20 @@ class App:
         ttk.Checkbutton(opts, text="Sempre no topo", variable=self.topmost_var,
                         command=lambda: self.root.attributes("-topmost", self.topmost_var.get())
                         ).grid(row=0, column=5, sticky="w")
+
+        ttk.Label(opts, text="Notas:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.hold_var = tk.StringVar(value=self.HOLD_OPTIONS[0])
+        ttk.Combobox(opts, textvariable=self.hold_var, values=self.HOLD_OPTIONS, state="readonly",
+                     width=22).grid(row=2, column=1, sticky="w", padx=(4, 16), pady=(6, 0))
+
+        ttk.Label(opts, text="Sustain:").grid(row=2, column=2, sticky="w", pady=(6, 0))
+        self.sustain_var = tk.StringVar(value=self.SUSTAIN_OPTIONS[0])
+        ttk.Combobox(opts, textvariable=self.sustain_var, values=self.SUSTAIN_OPTIONS, state="readonly",
+                     width=22).grid(row=2, column=3, columnspan=2, sticky="w", padx=(4, 16), pady=(6, 0))
+
+        self.keys88_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opts, text="88 teclas (Ctrl)", variable=self.keys88_var,
+                        command=self._keys_mode_changed).grid(row=2, column=5, sticky="w", pady=(6, 0))
         opts.columnconfigure(1, weight=1)
 
         # Controles
@@ -609,7 +752,7 @@ class App:
                 self.midi_notes = None
                 messagebox.showerror("Erro no MIDI", f"Não consegui ler este MIDI:\n{e}")
                 return
-            self.transpose_var.set(best_transpose(self.midi_notes, self.drums_var.get()))
+            self.transpose_var.set(best_transpose(self.midi_notes, self.drums_var.get(), self.keys88_var.get()))
             self._update_midi_info()
         else:
             self.midi_notes = None
@@ -643,7 +786,12 @@ class App:
             tr = int(self.transpose_var.get())
         except (tk.TclError, ValueError):
             tr = 0
-        return midi_to_events(self.midi_notes, tr, self.drums_var.get())
+        return midi_to_events(self.midi_notes, tr, self.drums_var.get(), self.keys88_var.get())
+
+    def _keys_mode_changed(self):
+        if self.midi_notes is not None:
+            self.transpose_var.set(best_transpose(self.midi_notes, self.drums_var.get(), self.keys88_var.get()))
+            self._update_midi_info()
 
     def new_song(self):
         self.current_path = None
@@ -654,6 +802,33 @@ class App:
         self.text.delete("1.0", "end")
         self.text.insert("1.0", "# bpm: 200\n# Cole aqui a partitura no formato Virtual Piano\n")
         self.text.focus_set()
+
+    def web_search(self, suffix):
+        name = self.search_var.get().strip()
+        if not name:
+            self.status.config(text="Digite o nome da música no campo de busca.")
+            return
+        webbrowser.open("https://www.google.com/search?q=" + urllib.parse.quote_plus(f"{name} {suffix}"))
+        self.status.config(text="Copie a partitura no navegador (Ctrl+C) e clique em \"Colar partitura copiada\".")
+
+    def paste_sheet(self):
+        try:
+            clip = self.root.clipboard_get()
+        except tk.TclError:
+            clip = ""
+        notes = sum(c in KEY_TO_NOTE for c in clip)
+        if notes < 4:
+            messagebox.showinfo("Colar", "A área de transferência não parece ter uma partitura.\n"
+                                         "Selecione a partitura no site, copie com Ctrl+C e tente de novo.")
+            return
+        self.new_song()
+        self.name_var.set(self.search_var.get().strip() or "Nova música")
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", clip.strip() + "\n")
+        self.bpm_var.set(read_sheet_bpm(clip, 200))
+        self.save_song()
+        self.status.config(text=f"Partitura colada e salva: {self.name_var.get()} ({notes} notas). "
+                                f"Ajuste o BPM se precisar e clique em Salvar.")
 
     def save_song(self):
         if self.midi_notes is not None:
@@ -729,7 +904,10 @@ class App:
             delay = float(self.delay_var.get()) if countdown else 0.3
         except (tk.TclError, ValueError):
             delay = 3.0
-        self.player.play(events, speed, delay)
+        if self.hold_var.get() == self.HOLD_OPTIONS[1]:  # notas curtas
+            events = [(t, keys, [0.015 * speed] * len(keys)) for t, keys, _ in events]
+        sustain = self.SUSTAIN_OPTIONS.index(self.sustain_var.get())
+        self.player.play(events, speed, delay, sustain)
         self.pause_btn.config(text="⏸ Pausar (F5)")
 
     def toggle_pause(self):
@@ -796,8 +974,8 @@ def main():
     except Exception:
         pass
     root = tk.Tk()
-    App(root)
-    root.protocol("WM_DELETE_WINDOW", lambda: (root.destroy()))
+    app = App(root)
+    root.protocol("WM_DELETE_WINDOW", lambda: (app.player.stop(), root.destroy()))
     root.mainloop()
 
 
