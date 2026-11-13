@@ -9,9 +9,13 @@ Aceita:
 Atalhos globais (funcionam com o Roblox em foco):
   F5 = tocar / pausar
   F6 = parar
+
+O botão "Prévia" toca a música no som do PC (sintetizador MIDI do Windows).
+As configurações ficam salvas em config.json, ao lado do app.
 """
 
 import ctypes
+import json
 import os
 import shutil
 import struct
@@ -118,9 +122,19 @@ def _send_scancodes(codes, up):
     user32.SendInput(len(codes), arr, ctypes.sizeof(INPUT))
 
 
+SUSTAIN_OFF, SUSTAIN_TOGGLE, SUSTAIN_HOLD = 0, 1, 2
+
+
+def tap(sc):
+    _send_scancodes([sc], up=False)
+    time.sleep(0.02)
+    _send_scancodes([sc], up=True)
+
+
 class Keyboard:
-    """Controla as teclas seguradas. Cada nota tem um id para que o "soltar"
-    de uma nota antiga não solte a mesma tecla tocada de novo depois."""
+    """Saída para o Roblox: aperta as teclas de verdade.
+    Cada nota tem um id para que o "soltar" de uma nota antiga não solte
+    a mesma tecla tocada de novo depois."""
 
     def __init__(self):
         self.owner = {}  # scancode -> (tecla, id)
@@ -163,11 +177,144 @@ class Keyboard:
             _send_scancodes(list(self.owner), up=True)
             self.owner.clear()
 
+    def sustain_on(self, mode):
+        if mode == SUSTAIN_TOGGLE:
+            tap(SC_SPACE)
+        elif mode == SUSTAIN_HOLD:
+            _send_scancodes([SC_SPACE], up=False)
 
-def tap(sc):
-    _send_scancodes([sc], up=False)
-    time.sleep(0.02)
-    _send_scancodes([sc], up=True)
+    def sustain_off(self, mode):
+        if mode == SUSTAIN_TOGGLE:
+            tap(SC_SPACE)
+        elif mode == SUSTAIN_HOLD:
+            _send_scancodes([SC_SPACE], up=True)
+
+    def suspend(self, mode):
+        """Pausa ou Roblox fora de foco: solta tudo para não 'digitar' em outra janela."""
+        self.release_all()
+        if mode == SUSTAIN_HOLD:
+            _send_scancodes([SC_SPACE], up=True)
+
+    def resume(self, mode):
+        if mode == SUSTAIN_HOLD:
+            _send_scancodes([SC_SPACE], up=False)
+
+    def close(self):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Prévia no PC (sintetizador MIDI do Windows, sem dependências)
+# ---------------------------------------------------------------------------
+
+winmm = ctypes.WinDLL("winmm")
+winmm.midiOutOpen.argtypes = (ctypes.POINTER(wintypes.HANDLE), wintypes.UINT,
+                              ctypes.c_size_t, ctypes.c_size_t, wintypes.DWORD)
+winmm.midiOutShortMsg.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+winmm.midiOutReset.argtypes = (wintypes.HANDLE,)
+winmm.midiOutClose.argtypes = (wintypes.HANDLE,)
+MIDI_MAPPER = 0xFFFFFFFF
+
+NOTE_OF_KEY = {k: n for n, k in NOTE_TO_KEY_88.items()}
+
+
+class MidiOutput:
+    """Saída para os alto-falantes do PC, com a mesma interface do Keyboard."""
+
+    def __init__(self):
+        self.handle = wintypes.HANDLE()
+        if winmm.midiOutOpen(ctypes.byref(self.handle), MIDI_MAPPER, 0, 0, 0) != 0:
+            raise OSError("Não consegui abrir o som MIDI do Windows.")
+        self._msg(0xC0, 0)  # instrumento: piano
+        self.owner = {}  # nota -> id
+
+    def _msg(self, status, d1, d2=0):
+        winmm.midiOutShortMsg(self.handle, status | (d1 << 8) | (d2 << 16))
+
+    def down(self, chars, ident):
+        for ch in chars:
+            n = NOTE_OF_KEY.get(ch)
+            if n is None:
+                continue
+            if n in self.owner:
+                self._msg(0x80, n)
+            self._msg(0x90, n, 96)
+            self.owner[n] = ident
+
+    def up(self, ch, ident):
+        n = NOTE_OF_KEY.get(ch)
+        if n is not None and self.owner.get(n) == ident:
+            self._msg(0x80, n)
+            del self.owner[n]
+
+    def release_all(self):
+        for n in self.owner:
+            self._msg(0x80, n)
+        self.owner.clear()
+
+    def sustain_on(self, mode):
+        if mode != SUSTAIN_OFF:
+            self._msg(0xB0, 64, 127)
+
+    def sustain_off(self, mode):
+        self._msg(0xB0, 64, 0)
+
+    def suspend(self, mode):
+        self.release_all()
+        self._msg(0xB0, 64, 0)
+
+    def resume(self, mode):
+        self.sustain_on(mode)
+
+    def close(self):
+        self.release_all()
+        winmm.midiOutReset(self.handle)
+        winmm.midiOutClose(self.handle)
+
+
+# ---------------------------------------------------------------------------
+# Detecção do Roblox em foco
+# ---------------------------------------------------------------------------
+
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+user32.GetForegroundWindow.restype = wintypes.HWND
+user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                ctypes.POINTER(wintypes.DWORD))
+kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+_focus_cache = {}
+
+
+def roblox_focused():
+    """True se a janela em primeiro plano é o Roblox (versão do site ou da Microsoft Store)."""
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return False
+    cached = _focus_cache.get(hwnd)
+    if cached is not None:
+        return cached
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetWindowTextW(hwnd, buf, 256)
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    exe = ""
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if h:
+        size = wintypes.DWORD(1024)
+        pbuf = ctypes.create_unicode_buffer(1024)
+        if kernel32.QueryFullProcessImageNameW(h, 0, pbuf, ctypes.byref(size)):
+            exe = os.path.basename(pbuf.value).lower()
+        kernel32.CloseHandle(h)
+    ok = "roblox" in exe or buf.value.strip() == "Roblox"
+    if len(_focus_cache) > 200:
+        _focus_cache.clear()
+    _focus_cache[hwnd] = ok
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +392,11 @@ def parse_sheet(text, bpm):
 # Leitor de MIDI (sem dependências)
 # ---------------------------------------------------------------------------
 
+GM_FAMILIES = ["Piano", "Percussão cromática", "Órgão", "Violão/Guitarra", "Baixo", "Cordas",
+               "Conjunto/Coral", "Metais", "Palhetas", "Flautas", "Synth (solo)", "Synth (fundo)",
+               "Synth (efeitos)", "Étnico", "Percussão", "Efeitos"]
+
+
 def _read_varlen(data, pos):
     value = 0
     while True:
@@ -256,7 +408,10 @@ def _read_varlen(data, pos):
 
 
 def parse_midi(path):
-    """Retorna lista de (início_seg, nota, canal, duração_seg)."""
+    """Retorna (notas, partes).
+    notas:  lista de (início_seg, nota, canal, duração_seg, parte)
+    partes: {parte: {"track", "ch", "name", "family", "count", "avg"}}, parte = "faixa:canal"
+    """
     with open(path, "rb") as f:
         data = f.read()
     if data[:4] != b"MThd":
@@ -268,9 +423,12 @@ def parse_midi(path):
     tpq = division
     pos = 8 + hlen
 
-    raw_notes = []   # (tick_inicio, tick_fim, nota, canal)
-    tempos = []      # (tick, microssegundos por semínima)
-    for _ in range(ntracks):
+    raw_notes = []    # (tick_inicio, tick_fim, nota, canal, faixa)
+    tempos = []       # (tick, microssegundos por semínima)
+    track_names = {}  # faixa -> nome
+    prog_tc = {}      # (faixa, canal) -> programa
+    prog_ch = {}      # canal -> programa
+    for ti in range(ntracks):
         while pos + 8 <= len(data) and data[pos:pos + 4] != b"MTrk":
             # pula chunks desconhecidos
             clen = struct.unpack(">I", data[pos + 4:pos + 8])[0]
@@ -294,6 +452,8 @@ def parse_midi(path):
                 mlen, p = _read_varlen(data, p + 1)
                 if mtype == 0x51 and mlen == 3:
                     tempos.append((tick, int.from_bytes(data[p:p + 3], "big")))
+                elif mtype == 0x03 and ti not in track_names:
+                    track_names[ti] = data[p:p + mlen].decode("latin-1", "replace").strip()
                 elif mtype == 0x2F:
                     p += mlen
                     break
@@ -305,6 +465,9 @@ def parse_midi(path):
                 kind = status & 0xF0
                 ch = status & 0x0F
                 if kind in (0xC0, 0xD0):
+                    if kind == 0xC0:
+                        prog_tc.setdefault((ti, ch), data[p])
+                        prog_ch.setdefault(ch, data[p])
                     p += 1
                 else:
                     d1, d2 = data[p], data[p + 1]
@@ -314,10 +477,10 @@ def parse_midi(path):
                     elif kind == 0x80 or (kind == 0x90 and d2 == 0):
                         starts = active.get((ch, d1))
                         if starts:
-                            raw_notes.append((starts.pop(0), tick, d1, ch))
+                            raw_notes.append((starts.pop(0), tick, d1, ch, ti))
         for (ch, n), starts in active.items():  # notas sem "note off"
             for s in starts:
-                raw_notes.append((s, s + tpq, n, ch))
+                raw_notes.append((s, s + tpq, n, ch, ti))
 
     # converte ticks para segundos usando o mapa de tempo
     tempos.sort()
@@ -342,22 +505,49 @@ def parse_midi(path):
         stk, ssec, sus = seg_start[lo]
         return ssec + (t - stk) * sus / 1e6 / tpq
 
-    notes = []
-    for s, e, n, c in raw_notes:
+    notes, parts = [], {}
+    for s, e, n, c, ti in raw_notes:
         ts = tick_to_sec(s)
-        notes.append((ts, n, c, max(0.0, tick_to_sec(e) - ts)))
+        part = f"{ti}:{c}"
+        notes.append((ts, n, c, max(0.0, tick_to_sec(e) - ts), part))
+        info = parts.get(part)
+        if info is None:
+            prog = prog_tc.get((ti, c), prog_ch.get(c, 0))
+            info = parts[part] = {"track": ti, "ch": c, "name": track_names.get(ti, ""),
+                                  "family": "Bateria" if c == 9 else GM_FAMILIES[prog // 8],
+                                  "count": 0, "sum": 0}
+        info["count"] += 1
+        info["sum"] += n
+    for info in parts.values():
+        info["avg"] = info.pop("sum") / info["count"]
     notes.sort()
-    return notes
+    return notes, parts
 
 
-def midi_to_events(notes, transpose=0, skip_drums=True, keys88=False, chord_window=0.025):
-    """Agrupa notas próximas em acordes e converte para teclas."""
+def default_parts(parts):
+    """Todas as partes, menos a bateria."""
+    return {p for p, info in parts.items() if info["ch"] != 9}
+
+
+def melody_part(parts):
+    """Chuta qual parte é a melodia: a mais aguda entre as que têm bastante nota."""
+    cands = [(p, i) for p, i in parts.items() if i["ch"] != 9]
+    if not cands:
+        return set()
+    biggest = max(i["count"] for _, i in cands)
+    cands = [(p, i) for p, i in cands if i["count"] >= biggest * 0.15]
+    return {max(cands, key=lambda c: c[1]["avg"])[0]}
+
+
+def midi_to_events(notes, transpose=0, enabled=None, keys88=False, chord_window=0.025):
+    """Agrupa notas próximas em acordes e converte para teclas.
+    enabled: conjunto de partes a tocar (None = todas menos bateria)."""
     note_to_key = NOTE_TO_KEY_88 if keys88 else NOTE_TO_KEY
     low, high = min(note_to_key), max(note_to_key)
     events = []
     out_of_range = 0
-    for t, n, ch, dur in notes:
-        if skip_drums and ch == 9:
+    for t, n, ch, dur, part in notes:
+        if (ch == 9) if enabled is None else (part not in enabled):
             continue
         n += transpose
         if n < low or n > high:
@@ -384,11 +574,12 @@ def midi_to_events(notes, transpose=0, skip_drums=True, keys88=False, chord_wind
     return events, out_of_range
 
 
-def best_transpose(notes, skip_drums=True, keys88=False):
+def best_transpose(notes, enabled=None, keys88=False):
     """Escolhe a oitava (-24..24) que deixa mais notas dentro do teclado, sem mudar o tom."""
     note_to_key = NOTE_TO_KEY_88 if keys88 else NOTE_TO_KEY
     low, high = min(note_to_key), max(note_to_key)
-    pitches = [n for _, n, ch, _ in notes if not (skip_drums and ch == 9)]
+    pitches = [n for _, n, ch, _, part in notes
+               if not ((ch == 9) if enabled is None else (part not in enabled))]
     if not pitches:
         return 0
     best, best_score = 0, None
@@ -421,10 +612,15 @@ def events_to_sheet(events, step):
 # Motor de reprodução
 # ---------------------------------------------------------------------------
 
-SUSTAIN_OFF, SUSTAIN_TOGGLE, SUSTAIN_HOLD = 0, 1, 2
-
-
 class Player:
+    """Toca eventos numa saída (Keyboard = Roblox, MidiOutput = prévia no PC).
+
+    on_progress(i, total, valor, fim):
+      i = -1 -> contagem regressiva (valor = segundos restantes)
+      i = -2 -> esperando o Roblox ficar em foco
+      i >= 0 -> tocando (valor = segundos decorridos)
+    """
+
     def __init__(self, on_progress, on_finish):
         self.on_progress = on_progress
         self.on_finish = on_finish
@@ -440,11 +636,14 @@ class Player:
     def paused(self):
         return self.pause_flag.is_set()
 
-    def play(self, events, speed=1.0, delay=0.0, sustain=SUSTAIN_OFF):
+    def play(self, events, speed=1.0, delay=0.0, sustain=SUSTAIN_OFF,
+             output_factory=Keyboard, focus_check=None):
         self.stop()
         self.stop_flag.clear()
         self.pause_flag.clear()
-        self.thread = threading.Thread(target=self._run, args=(events, speed, delay, sustain), daemon=True)
+        self.thread = threading.Thread(
+            target=self._run, args=(events, speed, delay, sustain, output_factory, focus_check),
+            daemon=True)
         self.thread.start()
 
     def toggle_pause(self):
@@ -459,16 +658,38 @@ class Player:
         if self.thread and self.thread.is_alive() and threading.current_thread() is not self.thread:
             self.thread.join(timeout=1)
 
-    def _run(self, events, speed, delay, sustain):
+    def _blocked(self, focus_check):
+        return self.pause_flag.is_set() or (focus_check is not None and not focus_check())
+
+    def _wait_unblocked(self, focus_check, total, end_time):
+        """Espera sair da pausa e o Roblox voltar ao foco. False se mandaram parar."""
+        reported = False
+        while not self.stop_flag.is_set():
+            if self.pause_flag.is_set():
+                time.sleep(0.03)
+                continue
+            if focus_check is not None and not focus_check():
+                if not reported:
+                    self.on_progress(-2, total, 0, end_time)
+                    reported = True
+                time.sleep(0.05)
+                continue
+            return True
+        return False
+
+    def _run(self, events, speed, delay, sustain, output_factory, focus_check):
         total = len(events)
         end_time = events[-1][0] / speed if events else 0
-        t_deadline = time.perf_counter() + delay
-        while time.perf_counter() < t_deadline:
+        deadline = time.perf_counter() + delay
+        while time.perf_counter() < deadline:
             if self.stop_flag.is_set():
                 self.on_finish(False)
                 return
-            self.on_progress(-1, total, t_deadline - time.perf_counter(), end_time)
+            self.on_progress(-1, total, deadline - time.perf_counter(), end_time)
             time.sleep(0.05)
+        if not self._wait_unblocked(focus_check, total, end_time):
+            self.on_finish(False)
+            return
 
         # linha do tempo: apertar (1) e soltar (0); no mesmo instante, solta antes de apertar
         actions = []
@@ -478,11 +699,13 @@ class Player:
                 actions.append(((t + d) / speed, 0, idx, k))
         actions.sort(key=lambda a: (a[0], a[1]))
 
-        kb = Keyboard()
-        if sustain == SUSTAIN_TOGGLE:
-            tap(SC_SPACE)
-        elif sustain == SUSTAIN_HOLD:
-            _send_scancodes([SC_SPACE], up=False)
+        try:
+            out = output_factory()
+        except OSError as e:
+            self.on_progress(-3, total, str(e), end_time)
+            self.on_finish(False)
+            return
+        out.sustain_on(sustain)
         completed = False
         try:
             start = time.perf_counter()
@@ -491,41 +714,69 @@ class Player:
                 while True:
                     if self.stop_flag.is_set():
                         return
-                    if self.pause_flag.is_set():
-                        kb.release_all()
-                        paused_at = time.perf_counter()
-                        while self.pause_flag.is_set() and not self.stop_flag.is_set():
-                            time.sleep(0.03)
-                        start += time.perf_counter() - paused_at
+                    if self._blocked(focus_check):
+                        out.suspend(sustain)
+                        stopped_at = time.perf_counter()
+                        if not self._wait_unblocked(focus_check, total, end_time):
+                            return
+                        start += time.perf_counter() - stopped_at
+                        out.resume(sustain)
+                        last_report = 0
                         continue
                     remaining = when - (time.perf_counter() - start)
                     if remaining <= 0:
                         break
                     time.sleep(min(remaining, 0.02) if remaining > 0.003 else 0)
                 if kind == 1:
-                    kb.down(keys, idx)
+                    out.down(keys, idx)
                     now = time.perf_counter()
                     if now - last_report > 0.1 or idx == total - 1:
                         last_report = now
                         self.on_progress(idx + 1, total, now - start, end_time)
                 else:
-                    kb.up(keys, idx)
+                    out.up(keys, idx)
             completed = True
         finally:
-            kb.release_all()
-            if sustain == SUSTAIN_TOGGLE:
-                tap(SC_SPACE)
-            elif sustain == SUSTAIN_HOLD:
-                _send_scancodes([SC_SPACE], up=True)
+            out.release_all()
+            out.sustain_off(sustain)
+            out.close()
             self.on_finish(completed)
+
+
+# ---------------------------------------------------------------------------
+# Configurações salvas (config.json ao lado do app)
+# ---------------------------------------------------------------------------
+
+APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+SONGS_DIR = os.path.join(APP_DIR, "musicas")
+CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            cfg = json.load(f)
+        if isinstance(cfg, dict):
+            cfg.setdefault("songs", {})
+            return cfg
+    except (OSError, ValueError):
+        pass
+    return {"songs": {}}
+
+
+def save_config(cfg):
+    tmp = CONFIG_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_PATH)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
 # Interface
 # ---------------------------------------------------------------------------
-
-APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
-SONGS_DIR = os.path.join(APP_DIR, "musicas")
 
 SAMPLE_SONGS = {
     "Ode à Alegria (Beethoven).txt":
@@ -577,20 +828,25 @@ class App:
 
     def __init__(self, root):
         self.root = root
+        self.cfg = load_config()
         root.title("Auto Piano — Roblox")
-        root.geometry("860x600")
-        root.minsize(720, 480)
+        root.geometry(self.cfg.get("geometry", "900x680"))
+        root.minsize(760, 560)
 
         self.player = Player(self._progress_cb, self._finish_cb)
         self.current_path = None
+        self.current_fname = None
         self.midi_notes = None
+        self.midi_parts = {}
+        self.part_ids = []
+        self.mode = "game"
         self._hotkey_state = {self.VK_F5: False, self.VK_F6: False}
         self._ui_queue = []
         self._ui_lock = threading.Lock()
 
         ensure_songs_dir()
         self._build_ui()
-        self.refresh_library()
+        self.refresh_library(select=self.cfg.get("last_song"))
         self._poll()
 
     # ---------- UI ----------
@@ -600,6 +856,7 @@ class App:
             style.theme_use("vista")
         except tk.TclError:
             pass
+        cfg = self.cfg
 
         main = ttk.Frame(self.root, padding=8)
         main.pack(fill="both", expand=True)
@@ -646,7 +903,22 @@ class App:
         self.save_btn = ttk.Button(top, text="Salvar", command=self.save_song)
         self.save_btn.pack(side="left")
 
-        self.text = tk.Text(right, wrap="word", font=("Consolas", 12), undo=True, height=12)
+        # Instrumentos do MIDI (só aparece para MIDI)
+        self.parts_frame = ttk.LabelFrame(right, text="Instrumentos do MIDI — clique para ligar/desligar",
+                                          padding=6)
+        self.parts_list = tk.Listbox(self.parts_frame, selectmode="multiple", height=5,
+                                     activestyle="none", exportselection=False)
+        self.parts_list.pack(side="left", fill="both", expand=True)
+        self.parts_list.bind("<<ListboxSelect>>", lambda e: self._parts_changed())
+        pbtns = ttk.Frame(self.parts_frame)
+        pbtns.pack(side="left", fill="y", padx=(6, 0))
+        ttk.Button(pbtns, text="Todos", command=lambda: self._set_parts(set(self.part_ids))).pack(fill="x")
+        ttk.Button(pbtns, text="Sem bateria",
+                   command=lambda: self._set_parts(default_parts(self.midi_parts))).pack(fill="x", pady=2)
+        ttk.Button(pbtns, text="Só melodia",
+                   command=lambda: self._set_parts(melody_part(self.midi_parts))).pack(fill="x")
+
+        self.text = tk.Text(right, wrap="word", font=("Consolas", 12), undo=True, height=10)
         self.text.pack(fill="both", expand=True, pady=6)
 
         # Opções
@@ -664,9 +936,15 @@ class App:
                                           command=self._update_midi_info)
         self.transpose_spin.grid(row=0, column=3, sticky="w", padx=(4, 16))
 
-        self.drums_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts, text="Ignorar bateria", variable=self.drums_var,
-                        command=self._update_midi_info).grid(row=0, column=4, sticky="w")
+        self.focus_var = tk.BooleanVar(value=cfg.get("focus_only", True))
+        ttk.Checkbutton(opts, text="Só tocar com o Roblox em foco",
+                        variable=self.focus_var).grid(row=0, column=4, sticky="w")
+
+        self.topmost_var = tk.BooleanVar(value=cfg.get("topmost", False))
+        ttk.Checkbutton(opts, text="Sempre no topo", variable=self.topmost_var,
+                        command=lambda: self.root.attributes("-topmost", self.topmost_var.get())
+                        ).grid(row=0, column=5, sticky="w", padx=(8, 0))
+        self.root.attributes("-topmost", self.topmost_var.get())
 
         ttk.Label(opts, text="Velocidade:").grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.speed_var = tk.IntVar(value=100)
@@ -677,34 +955,35 @@ class App:
         self.speed_lbl = ttk.Label(speed_frame, text="100%", width=5)
         self.speed_lbl.pack(side="left")
 
-        ttk.Label(opts, text="Contagem (s):").grid(row=1, column=4, sticky="w", pady=(6, 0))
-        self.delay_var = tk.IntVar(value=3)
-        ttk.Spinbox(opts, from_=0, to=10, width=4, textvariable=self.delay_var).grid(row=1, column=5, sticky="w", pady=(6, 0))
-
-        self.topmost_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="Sempre no topo", variable=self.topmost_var,
-                        command=lambda: self.root.attributes("-topmost", self.topmost_var.get())
-                        ).grid(row=0, column=5, sticky="w")
+        ttk.Label(opts, text="Contagem (s):").grid(row=1, column=4, sticky="e", pady=(6, 0))
+        self.delay_var = tk.IntVar(value=cfg.get("delay", 3))
+        ttk.Spinbox(opts, from_=0, to=10, width=4, textvariable=self.delay_var).grid(
+            row=1, column=5, sticky="w", padx=(8, 0), pady=(6, 0))
 
         ttk.Label(opts, text="Notas:").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        self.hold_var = tk.StringVar(value=self.HOLD_OPTIONS[0])
+        self.hold_var = tk.StringVar(value=cfg.get("hold", self.HOLD_OPTIONS[0]))
+        if self.hold_var.get() not in self.HOLD_OPTIONS:
+            self.hold_var.set(self.HOLD_OPTIONS[0])
         ttk.Combobox(opts, textvariable=self.hold_var, values=self.HOLD_OPTIONS, state="readonly",
                      width=22).grid(row=2, column=1, sticky="w", padx=(4, 16), pady=(6, 0))
 
         ttk.Label(opts, text="Sustain:").grid(row=2, column=2, sticky="w", pady=(6, 0))
-        self.sustain_var = tk.StringVar(value=self.SUSTAIN_OPTIONS[0])
+        self.sustain_var = tk.StringVar(value=cfg.get("sustain", self.SUSTAIN_OPTIONS[0]))
+        if self.sustain_var.get() not in self.SUSTAIN_OPTIONS:
+            self.sustain_var.set(self.SUSTAIN_OPTIONS[0])
         ttk.Combobox(opts, textvariable=self.sustain_var, values=self.SUSTAIN_OPTIONS, state="readonly",
                      width=22).grid(row=2, column=3, columnspan=2, sticky="w", padx=(4, 16), pady=(6, 0))
 
-        self.keys88_var = tk.BooleanVar(value=False)
+        self.keys88_var = tk.BooleanVar(value=cfg.get("keys88", False))
         ttk.Checkbutton(opts, text="88 teclas (Ctrl)", variable=self.keys88_var,
-                        command=self._keys_mode_changed).grid(row=2, column=5, sticky="w", pady=(6, 0))
+                        command=self._keys_mode_changed).grid(row=2, column=5, sticky="w", padx=(8, 0), pady=(6, 0))
         opts.columnconfigure(1, weight=1)
 
         # Controles
         ctrl = ttk.Frame(right)
         ctrl.pack(fill="x", pady=(8, 0))
         ttk.Button(ctrl, text="▶ Tocar", command=lambda: self.play(countdown=True)).pack(side="left")
+        ttk.Button(ctrl, text="🔊 Prévia", command=self.preview).pack(side="left", padx=(4, 0))
         self.pause_btn = ttk.Button(ctrl, text="⏸ Pausar (F5)", command=self.toggle_pause)
         self.pause_btn.pack(side="left", padx=4)
         ttk.Button(ctrl, text="■ Parar (F6)", command=self.stop).pack(side="left")
@@ -717,6 +996,47 @@ class App:
                                             "(ou, com o Roblox aberto, aperte F5).",
                                 foreground="#555")
         self.status.pack(fill="x", pady=(6, 0))
+
+    # ---------- Configurações ----------
+    def _int(self, var, default):
+        try:
+            return int(var.get())
+        except (tk.TclError, ValueError):
+            return default
+
+    def _store_song_settings(self):
+        """Guarda velocidade, BPM, transposição e instrumentos da música atual."""
+        if not self.current_fname:
+            return
+        s = self.cfg["songs"].setdefault(self.current_fname, {})
+        s["speed"] = self._int(self.speed_var, 100)
+        if self.midi_notes is not None:
+            s["transpose"] = self._int(self.transpose_var, 0)
+            s["keys88"] = self.keys88_var.get()
+            s["parts"] = sorted(self._enabled_parts())
+        else:
+            s["bpm"] = self._int(self.bpm_var, 200)
+
+    def save_settings(self):
+        self._store_song_settings()
+        self.cfg.update({
+            "focus_only": self.focus_var.get(),
+            "topmost": self.topmost_var.get(),
+            "delay": self._int(self.delay_var, 3),
+            "hold": self.hold_var.get(),
+            "sustain": self.sustain_var.get(),
+            "keys88": self.keys88_var.get(),
+            "last_song": self.current_fname,
+        })
+        if self.root.state() == "normal":
+            self.cfg["geometry"] = self.root.geometry()
+        save_config(self.cfg)
+
+    def on_close(self):
+        self.player.stop()
+        self.save_settings()
+        self.root.after_cancel(self._after_id)
+        self.root.destroy()
 
     # ---------- Biblioteca ----------
     def refresh_library(self, select=None):
@@ -740,27 +1060,75 @@ class App:
         if not sel:
             return
         fname = self.files[sel[0]]
+        if fname == self.current_fname and self.current_path:
+            return
+        self._store_song_settings()
         path = os.path.join(SONGS_DIR, fname)
+        s = self.cfg["songs"].get(fname, {})
         self.current_path = path
+        self.current_fname = fname
         self.name_var.set(os.path.splitext(fname)[0])
+        self.speed_var.set(s.get("speed", 100))
+        self.speed_lbl.config(text=f"{self.speed_var.get()}%")
         self.text.config(state="normal")
         self.text.delete("1.0", "end")
         if fname.lower().endswith((".mid", ".midi")):
             try:
-                self.midi_notes = parse_midi(path)
+                self.midi_notes, self.midi_parts = parse_midi(path)
             except Exception as e:
-                self.midi_notes = None
+                self.midi_notes, self.midi_parts = None, {}
+                self.parts_frame.pack_forget()
                 messagebox.showerror("Erro no MIDI", f"Não consegui ler este MIDI:\n{e}")
                 return
-            self.transpose_var.set(best_transpose(self.midi_notes, self.drums_var.get(), self.keys88_var.get()))
+            if "keys88" in s:
+                self.keys88_var.set(s["keys88"])
+            self._fill_parts(set(s["parts"]) & set(self.midi_parts) if "parts" in s
+                             else default_parts(self.midi_parts))
+            if "transpose" in s:
+                self.transpose_var.set(s["transpose"])
+            else:
+                self.transpose_var.set(best_transpose(self.midi_notes, self._enabled_parts(),
+                                                      self.keys88_var.get()))
             self._update_midi_info()
         else:
-            self.midi_notes = None
+            self.midi_notes, self.midi_parts = None, {}
+            self.parts_frame.pack_forget()
             with open(path, encoding="utf-8", errors="replace") as f:
                 content = f.read()
             self.text.insert("1.0", content)
-            self.bpm_var.set(read_sheet_bpm(content, self.bpm_var.get()))
+            self.bpm_var.set(s.get("bpm", read_sheet_bpm(content, self.bpm_var.get())))
             self.status.config(text=f"Partitura carregada: {self.name_var.get()}")
+
+    # ---------- Instrumentos do MIDI ----------
+    def _fill_parts(self, enabled):
+        self.part_ids = sorted(self.midi_parts, key=lambda p: (self.midi_parts[p]["track"],
+                                                               self.midi_parts[p]["ch"]))
+        self.parts_list.delete(0, "end")
+        for p in self.part_ids:
+            info = self.midi_parts[p]
+            name = info["name"] or f"Faixa {info['track'] + 1}"
+            self.parts_list.insert("end", f"{info['family']} — {name}  ({info['count']} notas)")
+        self._select_parts(enabled)
+        self.parts_frame.pack(fill="x", pady=(6, 0), before=self.text)
+
+    def _select_parts(self, enabled):
+        self.parts_list.selection_clear(0, "end")
+        for i, p in enumerate(self.part_ids):
+            if p in enabled:
+                self.parts_list.selection_set(i)
+
+    def _enabled_parts(self):
+        return {self.part_ids[i] for i in self.parts_list.curselection()}
+
+    def _set_parts(self, enabled):
+        if self.midi_notes is None:
+            return
+        self._select_parts(enabled)
+        self._parts_changed()
+
+    def _parts_changed(self):
+        self.transpose_var.set(best_transpose(self.midi_notes, self._enabled_parts(), self.keys88_var.get()))
+        self._update_midi_info()
 
     def _update_midi_info(self):
         if self.midi_notes is None:
@@ -770,32 +1138,32 @@ class App:
         self.text.config(state="normal")
         self.text.delete("1.0", "end")
         self.text.insert("1.0",
-                         f"Arquivo MIDI\n\n"
+                         f"Arquivo MIDI — {len(self._enabled_parts())} de {len(self.part_ids)} instrumentos ligados\n\n"
                          f"Notas/acordes: {len(events)}\n"
                          f"Duração: {fmt_time(dur)}\n"
                          f"Notas fora do teclado (ajustadas de oitava): {oor}\n\n"
-                         f"Dica: use \"Transpor\" para mudar o tom. O valor inicial foi escolhido\n"
-                         f"automaticamente para caber o máximo de notas no piano.\n\n"
+                         f"Dica: use \"Transpor\" para mudar o tom e \"🔊 Prévia\" para ouvir no PC.\n\n"
                          f"Prévia em formato Virtual Piano:\n\n"
                          + events_to_sheet(events[:400], 0.15))
         self.text.config(state="disabled")
         self.status.config(text=f"MIDI carregado: {self.name_var.get()}")
 
     def _midi_events(self):
-        try:
-            tr = int(self.transpose_var.get())
-        except (tk.TclError, ValueError):
-            tr = 0
-        return midi_to_events(self.midi_notes, tr, self.drums_var.get(), self.keys88_var.get())
+        return midi_to_events(self.midi_notes, self._int(self.transpose_var, 0),
+                              self._enabled_parts(), self.keys88_var.get())
 
     def _keys_mode_changed(self):
         if self.midi_notes is not None:
-            self.transpose_var.set(best_transpose(self.midi_notes, self.drums_var.get(), self.keys88_var.get()))
+            self.transpose_var.set(best_transpose(self.midi_notes, self._enabled_parts(), self.keys88_var.get()))
             self._update_midi_info()
 
+    # ---------- Edição ----------
     def new_song(self):
+        self._store_song_settings()
         self.current_path = None
-        self.midi_notes = None
+        self.current_fname = None
+        self.midi_notes, self.midi_parts = None, {}
+        self.parts_frame.pack_forget()
         self.listbox.selection_clear(0, "end")
         self.name_var.set("Nova música")
         self.text.config(state="normal")
@@ -840,20 +1208,22 @@ class App:
             messagebox.showwarning("Nome", "Dê um nome para a música.")
             return
         content = self.text.get("1.0", "end-1c")
-        try:
-            bpm = int(self.bpm_var.get())
-        except (tk.TclError, ValueError):
-            bpm = 200
+        bpm = self._int(self.bpm_var, 200)
         lines = [l for l in content.splitlines() if not (l.strip().lower().startswith("#") and "bpm" in l.lower())]
         content = f"# bpm: {bpm}\n" + "\n".join(lines)
         fname = name + ".txt"
         path = os.path.join(SONGS_DIR, fname)
+        old = self.current_fname
         if self.current_path and os.path.abspath(self.current_path) != os.path.abspath(path) \
                 and self.current_path.lower().endswith(".txt") and os.path.exists(self.current_path):
             os.remove(self.current_path)  # renomeado
+            if old in self.cfg["songs"]:
+                self.cfg["songs"][fname] = self.cfg["songs"].pop(old)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
         self.current_path = path
+        self.current_fname = fname
+        self._store_song_settings()
         self.refresh_library(select=fname)
         self.status.config(text=f"Salvo: {name}")
 
@@ -877,8 +1247,11 @@ class App:
         fname = self.files[sel[0]]
         if messagebox.askyesno("Excluir", f"Excluir \"{fname}\"?"):
             os.remove(os.path.join(SONGS_DIR, fname))
+            self.cfg["songs"].pop(fname, None)
             self.current_path = None
-            self.midi_notes = None
+            self.current_fname = None
+            self.midi_notes, self.midi_parts = None, {}
+            self.parts_frame.pack_forget()
             self.text.config(state="normal")
             self.text.delete("1.0", "end")
             self.refresh_library()
@@ -888,27 +1261,34 @@ class App:
         if self.midi_notes is not None:
             events, _ = self._midi_events()
             return events
-        try:
-            bpm = int(self.bpm_var.get())
-        except (tk.TclError, ValueError):
-            bpm = 200
-        return parse_sheet(self.text.get("1.0", "end-1c"), bpm)
+        return parse_sheet(self.text.get("1.0", "end-1c"), self._int(self.bpm_var, 200))
 
-    def play(self, countdown=True):
+    def _start(self, mode, delay):
         events = self._build_events()
         if not events:
-            self.status.config(text="Nada para tocar — escolha ou escreva uma música.")
+            self.status.config(text="Nada para tocar — escolha uma música (ou ligue algum instrumento do MIDI).")
             return
         speed = max(0.25, self.speed_var.get() / 100.0)
-        try:
-            delay = float(self.delay_var.get()) if countdown else 0.3
-        except (tk.TclError, ValueError):
-            delay = 3.0
         if self.hold_var.get() == self.HOLD_OPTIONS[1]:  # notas curtas
             events = [(t, keys, [0.015 * speed] * len(keys)) for t, keys, _ in events]
         sustain = self.SUSTAIN_OPTIONS.index(self.sustain_var.get())
-        self.player.play(events, speed, delay, sustain)
+        self.mode = mode
+        if mode == "preview":
+            self.player.play(events, speed, 0, sustain, output_factory=MidiOutput)
+        else:
+            focus = roblox_focused if self.focus_var.get() else None
+            self.player.play(events, speed, delay, sustain, output_factory=Keyboard, focus_check=focus)
         self.pause_btn.config(text="⏸ Pausar (F5)")
+        self.save_settings()
+
+    def play(self, countdown=True):
+        delay = float(self._int(self.delay_var, 3)) if countdown else 0.3
+        self._start("game", delay)
+
+    def preview(self):
+        self._start("preview", 0)
+        if self.player.playing:
+            self.status.config(text="🔊 Prévia tocando no PC…   F6 = parar")
 
     def toggle_pause(self):
         if not self.player.playing:
@@ -924,9 +1304,9 @@ class App:
         self.pause_btn.config(text="⏸ Pausar (F5)")
 
     # callbacks do thread do player -> fila para a UI
-    def _progress_cb(self, i, total, elapsed, end):
+    def _progress_cb(self, i, total, value, end):
         with self._ui_lock:
-            self._ui_queue.append(("progress", i, total, elapsed, end))
+            self._ui_queue.append(("progress", i, total, value, end))
 
     def _finish_cb(self, completed):
         with self._ui_lock:
@@ -951,21 +1331,27 @@ class App:
             items, self._ui_queue = self._ui_queue, []
         for item in items:
             if item[0] == "progress":
-                _, i, total, elapsed, end = item
-                if i < 0:
-                    self.status.config(text=f"Começando em {elapsed:.1f}s… clique na janela do Roblox!")
+                _, i, total, value, end = item
+                if i == -1:
+                    self.status.config(text=f"Começando em {value:.1f}s… clique na janela do Roblox!")
                     self.progress["value"] = 0
+                elif i == -2:
+                    self.status.config(text="⏳ Esperando o Roblox… clique na janela do jogo para tocar "
+                                            "(o app pausa quando o Roblox sai do foco).")
+                elif i == -3:
+                    self.status.config(text=f"Erro: {value}")
                 else:
                     self.progress["value"] = 1000 * i / max(total, 1)
-                    self.time_lbl.config(text=f"{fmt_time(elapsed)} / {fmt_time(end)}")
+                    self.time_lbl.config(text=f"{fmt_time(value)} / {fmt_time(end)}")
                     if not self.player.paused:
-                        self.status.config(text=f"Tocando… ({i}/{total})   F5 = pausar, F6 = parar")
+                        where = "🔊 Prévia no PC" if self.mode == "preview" else "Tocando no Roblox"
+                        self.status.config(text=f"{where}… ({i}/{total})   F5 = pausar, F6 = parar")
             elif item[0] == "finish":
                 if item[1]:
                     self.progress["value"] = 1000
                     self.status.config(text="Música terminada! 🎵")
                 self.pause_btn.config(text="⏸ Pausar (F5)")
-        self.root.after(30, self._poll)
+        self._after_id = self.root.after(30, self._poll)
 
 
 def main():
@@ -975,7 +1361,7 @@ def main():
         pass
     root = tk.Tk()
     app = App(root)
-    root.protocol("WM_DELETE_WINDOW", lambda: (app.player.stop(), root.destroy()))
+    root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()
 
 

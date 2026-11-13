@@ -2,3 +2,5 @@ __pycache__/
 musicas/
 *.mid
 *.midi
+config.json
+config.json.tmp

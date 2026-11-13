@@ -4,7 +4,11 @@ App para Windows que toca músicas automaticamente nos pianos do Roblox, simulan
 
 ## Recursos
 
-- Toca **arquivos MIDI** (`.mid`) — escolhe a oitava automaticamente e ignora a bateria
+- Toca **arquivos MIDI** (`.mid`) — escolhe a oitava automaticamente
+- **Escolha de instrumentos do MIDI**: ligue/desligue cada parte, ou use "Só melodia"
+- **Prévia no PC** (🔊): ouve a música pelo som do Windows antes de ir pro jogo
+- **Só toca com o Roblox em foco**: se você trocar de janela, pausa e solta as teclas; volta sozinho quando o Roblox volta ao foco
+- **Lembra tudo**: opções, última música e as configurações de cada música (velocidade, BPM, tom, instrumentos) ficam em `config.json`
 - Toca **partituras em texto** no formato Virtual Piano
 - **Notas longas**: segura cada tecla pelo tempo certo da nota (ou modo de notas curtas)
 - **Sustain** com Espaço: alternar (liga no início e desliga no fim) ou segurar
