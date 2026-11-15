@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import unicodedata
 import urllib.parse
 import webbrowser
 from ctypes import wintypes
@@ -816,6 +817,12 @@ def ensure_songs_dir():
                 f.write(text)
 
 
+def _fold(s):
+    """Minúsculas e sem acentos, para a busca: 'Já Que' -> 'ja que'."""
+    s = unicodedata.normalize("NFKD", s.casefold())
+    return "".join(c for c in s if not unicodedata.combining(c)).replace("_", " ").replace("-", " ")
+
+
 def fmt_time(s):
     s = max(0, int(s))
     return f"{s // 60}:{s % 60:02d}"
@@ -880,8 +887,28 @@ class App:
                    ).pack(side="left", expand=True, fill="x")
         ttk.Button(search, text="📋 Colar partitura copiada", command=self.paste_sheet).pack(fill="x", pady=(2, 0))
 
+        ttk.Separator(left).pack(fill="x", pady=(2, 6))
+        fhead = ttk.Frame(left)
+        fhead.pack(fill="x")
+        ttk.Label(fhead, text="🔍 Procurar nas minhas músicas:").pack(side="left")
+        self.count_lbl = ttk.Label(fhead, text="", foreground="#666")
+        self.count_lbl.pack(side="right")
+        frow = ttk.Frame(left)
+        frow.pack(fill="x", pady=(2, 4))
+        self.filter_var = tk.StringVar()
+        self.filter_entry = ttk.Entry(frow, textvariable=self.filter_var)
+        self.filter_entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(frow, text="✕", width=3, command=self.clear_filter).pack(side="left", padx=(2, 0))
+        self.filter_var.trace_add("write", lambda *a: self._apply_filter())
+        self.filter_entry.bind("<Return>", lambda e: self._pick_filtered(0))
+        self.filter_entry.bind("<Down>", lambda e: self._pick_filtered(0, focus=True))
+        self.filter_entry.bind("<Escape>", lambda e: self.clear_filter())
+        self.root.bind("<Control-f>", lambda e: (self.filter_entry.focus_set(),
+                                                 self.filter_entry.select_range(0, "end")))
+
         self.listbox = tk.Listbox(left, width=32, activestyle="none", exportselection=False)
         self.listbox.pack(fill="both", expand=True)
+        self.listbox.bind("<Return>", lambda e: self.play(countdown=True))
         self.listbox.bind("<<ListboxSelect>>", lambda e: self.load_selected())
         self.listbox.bind("<Double-Button-1>", lambda e: self.play(countdown=True))
         btns = ttk.Frame(left)
@@ -936,29 +963,19 @@ class App:
                                           command=self._update_midi_info)
         self.transpose_spin.grid(row=0, column=3, sticky="w", padx=(4, 16))
 
-        self.focus_var = tk.BooleanVar(value=cfg.get("focus_only", True))
-        ttk.Checkbutton(opts, text="Só tocar com o Roblox em foco",
-                        variable=self.focus_var).grid(row=0, column=4, sticky="w")
-
-        self.topmost_var = tk.BooleanVar(value=cfg.get("topmost", False))
-        ttk.Checkbutton(opts, text="Sempre no topo", variable=self.topmost_var,
-                        command=lambda: self.root.attributes("-topmost", self.topmost_var.get())
-                        ).grid(row=0, column=5, sticky="w", padx=(8, 0))
-        self.root.attributes("-topmost", self.topmost_var.get())
+        ttk.Label(opts, text="Contagem (s):").grid(row=0, column=4, sticky="w")
+        self.delay_var = tk.IntVar(value=cfg.get("delay", 3))
+        ttk.Spinbox(opts, from_=0, to=10, width=4, textvariable=self.delay_var).grid(
+            row=0, column=5, sticky="w", padx=(4, 0))
 
         ttk.Label(opts, text="Velocidade:").grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.speed_var = tk.IntVar(value=100)
         speed_frame = ttk.Frame(opts)
-        speed_frame.grid(row=1, column=1, columnspan=3, sticky="we", pady=(6, 0))
+        speed_frame.grid(row=1, column=1, columnspan=5, sticky="we", padx=(4, 0), pady=(6, 0))
         ttk.Scale(speed_frame, from_=25, to=200, variable=self.speed_var,
                   command=lambda v: self.speed_lbl.config(text=f"{int(float(v))}%")).pack(side="left", fill="x", expand=True)
         self.speed_lbl = ttk.Label(speed_frame, text="100%", width=5)
         self.speed_lbl.pack(side="left")
-
-        ttk.Label(opts, text="Contagem (s):").grid(row=1, column=4, sticky="e", pady=(6, 0))
-        self.delay_var = tk.IntVar(value=cfg.get("delay", 3))
-        ttk.Spinbox(opts, from_=0, to=10, width=4, textvariable=self.delay_var).grid(
-            row=1, column=5, sticky="w", padx=(8, 0), pady=(6, 0))
 
         ttk.Label(opts, text="Notas:").grid(row=2, column=0, sticky="w", pady=(6, 0))
         self.hold_var = tk.StringVar(value=cfg.get("hold", self.HOLD_OPTIONS[0]))
@@ -972,12 +989,22 @@ class App:
         if self.sustain_var.get() not in self.SUSTAIN_OPTIONS:
             self.sustain_var.set(self.SUSTAIN_OPTIONS[0])
         ttk.Combobox(opts, textvariable=self.sustain_var, values=self.SUSTAIN_OPTIONS, state="readonly",
-                     width=22).grid(row=2, column=3, columnspan=2, sticky="w", padx=(4, 16), pady=(6, 0))
+                     width=22).grid(row=2, column=3, columnspan=3, sticky="w", padx=(4, 0), pady=(6, 0))
 
+        checks = ttk.Frame(opts)
+        checks.grid(row=3, column=0, columnspan=6, sticky="w", pady=(8, 0))
+        self.focus_var = tk.BooleanVar(value=cfg.get("focus_only", True))
+        ttk.Checkbutton(checks, text="Só tocar com o Roblox em foco",
+                        variable=self.focus_var).pack(side="left")
         self.keys88_var = tk.BooleanVar(value=cfg.get("keys88", False))
-        ttk.Checkbutton(opts, text="88 teclas (Ctrl)", variable=self.keys88_var,
-                        command=self._keys_mode_changed).grid(row=2, column=5, sticky="w", padx=(8, 0), pady=(6, 0))
-        opts.columnconfigure(1, weight=1)
+        ttk.Checkbutton(checks, text="88 teclas (Ctrl)", variable=self.keys88_var,
+                        command=self._keys_mode_changed).pack(side="left", padx=(16, 0))
+        self.topmost_var = tk.BooleanVar(value=cfg.get("topmost", False))
+        ttk.Checkbutton(checks, text="Sempre no topo", variable=self.topmost_var,
+                        command=lambda: self.root.attributes("-topmost", self.topmost_var.get())
+                        ).pack(side="left", padx=(16, 0))
+        self.root.attributes("-topmost", self.topmost_var.get())
+        opts.columnconfigure(6, weight=1)
 
         # Controles
         ctrl = ttk.Frame(right)
@@ -1040,14 +1067,12 @@ class App:
 
     # ---------- Biblioteca ----------
     def refresh_library(self, select=None):
-        self.files = sorted(
-            f for f in os.listdir(SONGS_DIR)
-            if f.lower().endswith((".txt", ".mid", ".midi"))
-        )
-        self.listbox.delete(0, "end")
-        for f in self.files:
-            icon = "🎹 " if f.lower().endswith((".mid", ".midi")) else "📄 "
-            self.listbox.insert("end", icon + os.path.splitext(f)[0])
+        self.all_files = sorted(
+            (f for f in os.listdir(SONGS_DIR) if f.lower().endswith((".txt", ".mid", ".midi"))),
+            key=lambda f: _fold(f))
+        if select and select in self.all_files and not self._matches(select):
+            self.filter_var.set("")  # mostra a música recém-salva/importada
+        self._apply_filter()
         if select and select in self.files:
             idx = self.files.index(select)
             self.listbox.selection_clear(0, "end")
@@ -1055,9 +1080,50 @@ class App:
             self.listbox.see(idx)
             self.load_selected()
 
+    def _matches(self, fname):
+        words = _fold(self.filter_var.get()).split()
+        name = _fold(os.path.splitext(fname)[0])
+        return all(w in name for w in words)
+
+    def _apply_filter(self):
+        if not hasattr(self, "all_files"):
+            return
+        self.files = [f for f in self.all_files if self._matches(f)]
+        self.listbox.delete(0, "end")
+        for f in self.files:
+            icon = "🎹 " if f.lower().endswith((".mid", ".midi")) else "📄 "
+            self.listbox.insert("end", icon + os.path.splitext(f)[0])
+        if not self.files and self.all_files:
+            self.listbox.insert("end", "  Nenhuma música encontrada")
+            self.listbox.itemconfig(0, foreground="#888", selectbackground="white",
+                                    selectforeground="#888")
+        if self.current_fname in self.files:  # mantém a música atual marcada
+            idx = self.files.index(self.current_fname)
+            self.listbox.selection_set(idx)
+            self.listbox.see(idx)
+        total = len(self.all_files)
+        self.count_lbl.config(text=f"{len(self.files)} de {total}" if self.filter_var.get().strip()
+                              else f"{total} músicas")
+
+    def _pick_filtered(self, idx, focus=False):
+        if not self.files:
+            return "break"
+        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_set(idx)
+        self.listbox.activate(idx)
+        self.listbox.see(idx)
+        self.load_selected()
+        if focus:
+            self.listbox.focus_set()
+        return "break"
+
+    def clear_filter(self):
+        self.filter_var.set("")
+        self.filter_entry.focus_set()
+
     def load_selected(self):
         sel = self.listbox.curselection()
-        if not sel:
+        if not sel or sel[0] >= len(self.files):
             return
         fname = self.files[sel[0]]
         if fname == self.current_fname and self.current_path:
@@ -1242,7 +1308,7 @@ class App:
 
     def delete_song(self):
         sel = self.listbox.curselection()
-        if not sel:
+        if not sel or sel[0] >= len(self.files):
             return
         fname = self.files[sel[0]]
         if messagebox.askyesno("Excluir", f"Excluir \"{fname}\"?"):
